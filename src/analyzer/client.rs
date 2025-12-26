@@ -6,6 +6,12 @@ use tokio::process::Child;
 
 use crate::analyzer::protocol::*;
 
+#[derive(Debug, Clone)]
+pub struct DefinitionDetails {
+    pub location: Location,
+    pub symbol_path: SymbolPath,
+}
+
 fn get_rust_analyzer_path() -> String {
     std::env::var("RUST_ANALYZER_PATH").unwrap_or_else(|_| {
         // Default to ~/.cargo/bin/rust-analyzer
@@ -172,22 +178,183 @@ impl RustAnalyzerClient {
     }
 
     // Tool implementation methods
+    fn ensure_initialized(&self) -> Result<()> {
+        if self.initialized {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Client not initialized"))
+        }
+    }
+
+    fn extract_result(response: &Value) -> Result<Value> {
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Missing result field in LSP response"))
+    }
+
+    fn position_in_range(range: &Range, position: &Position) -> bool {
+        let starts_before = range.start.line < position.line
+            || (range.start.line == position.line && range.start.character <= position.character);
+        let ends_after = range.end.line > position.line
+            || (range.end.line == position.line && range.end.character >= position.character);
+        starts_before && ends_after
+    }
+
+    fn select_definition_location(definition: DefinitionResponse) -> Option<Location> {
+        match definition {
+            DefinitionResponse::SingleLocation(location) => Some(location),
+            DefinitionResponse::LocationArray(mut locations) => locations.pop(),
+            DefinitionResponse::LocationLinks(mut links) => links.pop().map(|link| Location {
+                uri: link.target_uri,
+                range: link.target_selection_range,
+            }),
+        }
+    }
+
+    fn find_symbol_path_in_document_symbols(
+        symbols: &[DocumentSymbol],
+        position: &Position,
+    ) -> Option<SymbolPath> {
+        for symbol in symbols {
+            if Self::position_in_range(&symbol.selection_range, position) {
+                let mut path = vec![SymbolPathSegment {
+                    name: symbol.name.clone(),
+                    kind: symbol.kind,
+                }];
+
+                if let Some(children) = &symbol.children {
+                    if let Some(mut child_path) =
+                        Self::find_symbol_path_in_document_symbols(children, position)
+                    {
+                        path.append(&mut child_path);
+                    }
+                }
+
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    fn symbol_path_from_response(
+        symbols: DocumentSymbolResponse,
+        position: &Position,
+    ) -> Option<SymbolPath> {
+        match symbols {
+            DocumentSymbolResponse::DocumentSymbols(symbols) => {
+                Self::find_symbol_path_in_document_symbols(&symbols, position)
+            }
+            DocumentSymbolResponse::SymbolInformation(mut infos) => infos
+                .drain(..)
+                .find(|info| Self::position_in_range(&info.location.range, position))
+                .map(|info| {
+                    let mut path = Vec::new();
+                    if let Some(container) = info.container_name {
+                        path.push(SymbolPathSegment {
+                            name: container,
+                            kind: info.kind,
+                        });
+                    }
+                    path.push(SymbolPathSegment {
+                        name: info.name,
+                        kind: info.kind,
+                    });
+                    path
+                }),
+        }
+    }
+
+    async fn request_document_symbols(&mut self, uri: &str) -> Result<DocumentSymbolResponse> {
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.to_string(),
+            },
+        };
+
+        let response = self
+            .send_request_internal("textDocument/documentSymbol", serde_json::to_value(params)?)
+            .await?;
+
+        let result_value = Self::extract_result(&response)?;
+        let parsed: DocumentSymbolResponse = serde_json::from_value(result_value)?;
+        Ok(parsed)
+    }
+
+    pub async fn definition_details(
+        &mut self,
+        file_path: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<DefinitionDetails>> {
+        self.ensure_initialized()?;
+
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: format!("file://{}", file_path),
+            },
+            position: Position { line, character },
+        };
+
+        let response = self
+            .send_request_internal("textDocument/definition", serde_json::to_value(params)?)
+            .await?;
+
+        let result_value = Self::extract_result(&response)?;
+        let definition_response: DefinitionResponse = serde_json::from_value(result_value)?;
+        let Some(location) = Self::select_definition_location(definition_response) else {
+            return Ok(None);
+        };
+
+        let symbol_response = self.request_document_symbols(&location.uri).await;
+        let symbol_path = match symbol_response {
+            Ok(symbols) => {
+                Self::symbol_path_from_response(symbols, &location.range.start).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        };
+
+        Ok(Some(DefinitionDetails {
+            location,
+            symbol_path,
+        }))
+    }
+
+    fn format_symbol_path(path: &[SymbolPathSegment]) -> Option<String> {
+        if path.is_empty() {
+            None
+        } else {
+            Some(
+                path.iter()
+                    .map(|segment| segment.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            )
+        }
+    }
+
     pub async fn find_definition(
         &mut self,
         file_path: &str,
         line: u32,
         character: u32,
     ) -> Result<String> {
-        if !self.initialized {
-            return Err(anyhow::anyhow!("Client not initialized"));
-        }
+        self.ensure_initialized()?;
 
-        let params = create_text_document_position_params(file_path, line, character);
-        let response = self
-            .send_request_internal("textDocument/definition", params)
-            .await?;
+        let details = self
+            .definition_details(file_path, line, character)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No definition found"))?;
 
-        Ok(format!("Definition response: {response}"))
+        let path_display = Self::format_symbol_path(&details.symbol_path)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let start = details.location.range.start;
+        Ok(format!(
+            "Definition at {}:{}:{} ({path_display})",
+            details.location.uri,
+            start.line + 1,
+            start.character + 1
+        ))
     }
 
     pub async fn find_references(

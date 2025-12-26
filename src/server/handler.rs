@@ -783,6 +783,129 @@ impl RustMcpServer {
             ))])),
         }
     }
+
+    #[tool(description = "Inspect MIR for a symbol or position")]
+    async fn inspect_mir(
+        &self,
+        Parameters(InspectMirParams {
+            file_path,
+            line,
+            character,
+            symbol_name,
+            opt_level,
+            target,
+        }): Parameters<InspectMirParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({
+            "file_path": file_path,
+            "line": line,
+            "character": character,
+            "symbol_name": symbol_name,
+            "opt_level": opt_level,
+            "target": target
+        });
+
+        let mut analyzer = self.analyzer.lock().await;
+        match execute_tool("inspect_mir", args, &mut analyzer).await {
+            Ok(result) => {
+                if let Some(content) = result.content.first() {
+                    if let Some(text) = content.get("text") {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            text.as_str().unwrap_or("No result"),
+                        )]));
+                    }
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    "MIR inspection not implemented",
+                )]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Inspect LLVM IR for a symbol or position")]
+    async fn inspect_llvm_ir(
+        &self,
+        Parameters(InspectLlvmIrParams {
+            file_path,
+            line,
+            character,
+            symbol_name,
+            opt_level,
+            target,
+        }): Parameters<InspectLlvmIrParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({
+            "file_path": file_path,
+            "line": line,
+            "character": character,
+            "symbol_name": symbol_name,
+            "opt_level": opt_level,
+            "target": target
+        });
+
+        let mut analyzer = self.analyzer.lock().await;
+        match execute_tool("inspect_llvm_ir", args, &mut analyzer).await {
+            Ok(result) => {
+                if let Some(content) = result.content.first() {
+                    if let Some(text) = content.get("text") {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            text.as_str().unwrap_or("No result"),
+                        )]));
+                    }
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    "LLVM IR inspection not implemented",
+                )]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Inspect assembly for a symbol or position")]
+    async fn inspect_asm(
+        &self,
+        Parameters(InspectAsmParams {
+            file_path,
+            line,
+            character,
+            symbol_name,
+            opt_level,
+            target,
+        }): Parameters<InspectAsmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({
+            "file_path": file_path,
+            "line": line,
+            "character": character,
+            "symbol_name": symbol_name,
+            "opt_level": opt_level,
+            "target": target
+        });
+
+        let mut analyzer = self.analyzer.lock().await;
+        match execute_tool("inspect_asm", args, &mut analyzer).await {
+            Ok(result) => {
+                if let Some(content) = result.content.first() {
+                    if let Some(text) = content.get("text") {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            text.as_str().unwrap_or("No result"),
+                        )]));
+                    }
+                }
+                Ok(CallToolResult::success(vec![Content::text(
+                    "Assembly inspection not implemented",
+                )]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]

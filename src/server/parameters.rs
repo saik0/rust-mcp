@@ -144,3 +144,33 @@ pub struct MoveItemsParams {
     pub target_file: String,
     pub item_names: Vec<String>,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InspectMirParams {
+    pub file_path: String,
+    pub line: Option<u32>,
+    pub character: Option<u32>,
+    pub symbol_name: Option<String>,
+    pub opt_level: Option<String>,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InspectLlvmIrParams {
+    pub file_path: String,
+    pub line: Option<u32>,
+    pub character: Option<u32>,
+    pub symbol_name: Option<String>,
+    pub opt_level: Option<String>,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InspectAsmParams {
+    pub file_path: String,
+    pub line: Option<u32>,
+    pub character: Option<u32>,
+    pub symbol_name: Option<String>,
+    pub opt_level: Option<String>,
+    pub target: Option<String>,
+}

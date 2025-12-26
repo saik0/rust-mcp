@@ -30,6 +30,20 @@ pub struct ToolResult {
     pub content: Vec<serde_json::Map<String, Value>>,
 }
 
+fn not_implemented_tool_result(tool_name: &str) -> ToolResult {
+    ToolResult {
+        content: vec![
+            json!({
+                "type": "text",
+                "text": format!("{tool_name} not implemented")
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ],
+    }
+}
+
 pub async fn execute_tool(
     name: &str,
     args: Value,
@@ -76,6 +90,9 @@ pub async fn execute_tool(
         }
         "create_module" => crate::tools::advanced::create_module_impl(args, analyzer).await,
         "move_items" => crate::tools::advanced::move_items_impl(args, analyzer).await,
+        "inspect_mir" => Ok(not_implemented_tool_result("inspect_mir")),
+        "inspect_llvm_ir" => Ok(not_implemented_tool_result("inspect_llvm_ir")),
+        "inspect_asm" => Ok(not_implemented_tool_result("inspect_asm")),
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     }
 }
@@ -360,6 +377,54 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["source_file", "target_file", "item_names"]
+            }),
+        ),
+        ToolDefinition::new(
+            "inspect_mir",
+            "Inspect MIR for a symbol or source position",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                    "symbol_name": {"type": "string"},
+                    "opt_level": {"type": "string"},
+                    "target": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        ),
+        ToolDefinition::new(
+            "inspect_llvm_ir",
+            "Inspect LLVM IR for a symbol or source position",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                    "symbol_name": {"type": "string"},
+                    "opt_level": {"type": "string"},
+                    "target": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        ),
+        ToolDefinition::new(
+            "inspect_asm",
+            "Inspect assembly for a symbol or source position",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                    "symbol_name": {"type": "string"},
+                    "opt_level": {"type": "string"},
+                    "target": {"type": "string"}
+                },
+                "required": ["file_path"]
             }),
         ),
     ]

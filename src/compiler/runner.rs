@@ -1,9 +1,15 @@
 use anyhow::{Context, Result};
 use std::{
     collections::HashSet,
+    fmt,
     path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
-use tokio::{fs, process::Command};
+use tokio::{fs, io::AsyncReadExt, process::Command, time::timeout};
+
+const COMPILER_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_BYTE_LIMIT: usize = 1_000_000; // 1MB cap for stdout/stderr combined.
 
 /// Runs `cargo rustc` with an inspection-friendly configuration.
 ///
@@ -15,6 +21,35 @@ use tokio::{fs, process::Command};
 pub struct CompilerRunner {
     target_dir: PathBuf,
 }
+
+#[derive(Debug)]
+pub enum RunnerError {
+    Timeout(Duration),
+    OutputLimitExceeded { limit: usize, observed: usize },
+}
+
+impl fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunnerError::Timeout(duration) => {
+                write!(
+                    f,
+                    "compiler run exceeded the {}s timeout",
+                    duration.as_secs()
+                )
+            }
+            RunnerError::OutputLimitExceeded { limit, observed } => {
+                write!(
+                    f,
+                    "compiler output exceeded limit ({} bytes > {} bytes)",
+                    observed, limit
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunnerError {}
 
 impl Default for CompilerRunner {
     fn default() -> Self {
@@ -55,6 +90,8 @@ impl CompilerRunner {
         command.arg("rustc");
         command.env("CARGO_TARGET_DIR", &self.target_dir);
         command.arg("--offline");
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
         if let Some(manifest_path) = request.manifest_path {
             command.arg("--manifest-path");
@@ -90,18 +127,64 @@ impl CompilerRunner {
             command.arg(arg);
         }
 
-        let output = command
-            .output()
-            .await
+        let mut child = command
+            .spawn()
             .context("running cargo rustc with inspection settings")?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture compiler stdout"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture compiler stderr"))?;
+
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await?;
+            Ok::<_, anyhow::Error>(buf)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).await?;
+            Ok::<_, anyhow::Error>(buf)
+        });
+
+        let status = match timeout(COMPILER_TIMEOUT, child.wait()).await {
+            Ok(result) => result.context("running cargo rustc with inspection settings")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(RunnerError::Timeout(COMPILER_TIMEOUT).into());
+            }
+        };
+
+        let stdout = stdout_task
+            .await
+            .context("joining compiler stdout task")?
+            .context("reading compiler stdout")?;
+        let stderr = stderr_task
+            .await
+            .context("joining compiler stderr task")?
+            .context("reading compiler stderr")?;
+
+        let observed = stdout.len() + stderr.len();
+        if observed > OUTPUT_BYTE_LIMIT {
+            return Err(RunnerError::OutputLimitExceeded {
+                limit: OUTPUT_BYTE_LIMIT,
+                observed,
+            }
+            .into());
+        }
 
         let after = collect_files(&self.target_dir).await.unwrap_or_default();
         let artifacts = diff_paths(before, after, &self.target_dir);
 
         Ok(RunResult {
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
             artifacts,
         })
     }

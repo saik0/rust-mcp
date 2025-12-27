@@ -95,6 +95,10 @@ pub struct InspectionProvenance {
     pub toolchain_channel: ToolchainChannel,
     pub workspace_locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rustc_verbose_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rust_analyzer_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<TruncationSummary>,
@@ -147,6 +151,20 @@ pub struct InspectionView {
 impl InspectionView {
     pub fn curated() -> Vec<Self> {
         vec![
+            InspectionView {
+                name: "def",
+                description: "Definition location and symbol identity",
+                requires_nightly: false,
+                emit: None,
+                unpretty: None,
+            },
+            InspectionView {
+                name: "types",
+                description: "Type hierarchy for the symbol",
+                requires_nightly: false,
+                emit: None,
+                unpretty: None,
+            },
             InspectionView {
                 name: "llvm-ir",
                 description: "Lowered LLVM IR for a symbol",
@@ -202,6 +220,8 @@ pub struct InspectionContext {
     gating_mode: GatingMode,
     toolchain_channel: ToolchainChannel,
     workspace_root: PathBuf,
+    rustc_verbose_version: Option<String>,
+    rust_analyzer_version: Option<String>,
     env: BTreeMap<String, String>,
     workspace_lock: Arc<AsyncMutex<()>>,
 }
@@ -215,11 +235,15 @@ impl InspectionContext {
             DEFAULT_TARGET_DIR.to_string(),
         );
 
+        let toolchain = detect_toolchain_details();
+
         Self {
             limits: InspectionLimits::default(),
             gating_mode: default_gating_mode_from_env(),
-            toolchain_channel: detect_toolchain_channel(),
+            toolchain_channel: toolchain.channel,
             workspace_root: root.clone(),
+            rustc_verbose_version: toolchain.rustc_verbose_version,
+            rust_analyzer_version: detect_rust_analyzer_version(),
             env,
             workspace_lock: workspace_lock_for(&root),
         }
@@ -271,6 +295,8 @@ impl InspectionContext {
             gating_mode: self.gating_mode,
             toolchain_channel: self.toolchain_channel,
             workspace_locked: false,
+            rustc_verbose_version: self.rustc_verbose_version.clone(),
+            rust_analyzer_version: self.rust_analyzer_version.clone(),
             command: None,
             truncation: None,
         }
@@ -304,27 +330,78 @@ fn default_gating_mode_from_env() -> GatingMode {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ToolchainDetails {
+    channel: ToolchainChannel,
+    rustc_verbose_version: Option<String>,
+}
+
 pub fn detect_toolchain_channel() -> ToolchainChannel {
-    let output = std::process::Command::new("rustc").arg("-Vv").output();
+    detect_toolchain_details().channel
+}
 
-    let stdout = match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-        Err(_) => return ToolchainChannel::Stable,
-    };
+fn detect_toolchain_details() -> ToolchainDetails {
+    static DETAILS: OnceLock<ToolchainDetails> = OnceLock::new();
 
-    for line in stdout.lines() {
-        if let Some(release) = line.strip_prefix("release:") {
-            if release.contains("nightly") {
-                return ToolchainChannel::Nightly;
+    DETAILS
+        .get_or_init(|| {
+            let output = std::process::Command::new("rustc").arg("-Vv").output();
+
+            let stdout = match output {
+                Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+                Err(_) => {
+                    return ToolchainDetails {
+                        channel: ToolchainChannel::Stable,
+                        rustc_verbose_version: None,
+                    };
+                }
+            };
+
+            let mut channel = ToolchainChannel::Stable;
+            for line in stdout.lines() {
+                if let Some(release) = line.strip_prefix("release:") {
+                    if release.contains("nightly") {
+                        channel = ToolchainChannel::Nightly;
+                        break;
+                    }
+
+                    if release.contains("dev") {
+                        channel = ToolchainChannel::Dev;
+                        break;
+                    }
+                }
             }
 
-            if release.contains("dev") {
-                return ToolchainChannel::Dev;
+            ToolchainDetails {
+                channel,
+                rustc_verbose_version: Some(stdout),
             }
-        }
-    }
+        })
+        .clone()
+}
 
-    ToolchainChannel::Stable
+fn detect_rust_analyzer_version() -> Option<String> {
+    static VERSION: OnceLock<Option<String>> = OnceLock::new();
+
+    VERSION
+        .get_or_init(|| {
+            let ra_path = rust_analyzer_path();
+            let output = std::process::Command::new(&ra_path)
+                .arg("--version")
+                .output()
+                .ok()?;
+
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() { None } else { Some(text) }
+        })
+        .clone()
+}
+
+fn rust_analyzer_path() -> String {
+    env::var("RUST_ANALYZER_PATH").unwrap_or_else(|_| {
+        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{home}/.cargo/bin/rust-analyzer")
+    })
 }
 
 pub fn truncate_with_limits(

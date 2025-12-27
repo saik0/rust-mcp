@@ -174,3 +174,20 @@ pub struct InspectAsmParams {
     pub opt_level: Option<String>,
     pub target: Option<String>,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InspectParams {
+    pub view: String,
+    pub file_path: String,
+    pub line: u32,
+    pub character: u32,
+    pub symbol_name: Option<String>,
+    pub opt_level: Option<String>,
+    pub target: Option<String>,
+    pub gating_mode: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CapabilitiesParams {
+    pub gating_mode: Option<String>,
+}

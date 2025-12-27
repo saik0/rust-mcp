@@ -93,6 +93,8 @@ pub async fn execute_tool(
         "inspect_mir" => Ok(not_implemented_tool_result("inspect_mir")),
         "inspect_llvm_ir" => Ok(not_implemented_tool_result("inspect_llvm_ir")),
         "inspect_asm" => Ok(not_implemented_tool_result("inspect_asm")),
+        "inspect" => Ok(not_implemented_tool_result("inspect")),
+        "capabilities" => Ok(not_implemented_tool_result("capabilities")),
         _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
     }
 }
@@ -425,6 +427,34 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                     "target": {"type": "string"}
                 },
                 "required": ["file_path"]
+            }),
+        ),
+        ToolDefinition::new(
+            "inspect",
+            "Inspect compiler artifacts using curated presets",
+            json!({
+                "type": "object",
+                "properties": {
+                    "view": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 0},
+                    "character": {"type": "integer", "minimum": 0},
+                    "symbol_name": {"type": "string"},
+                    "opt_level": {"type": "string"},
+                    "target": {"type": "string"},
+                    "gating_mode": {"type": "string"}
+                },
+                "required": ["view", "file_path", "line", "character"]
+            }),
+        ),
+        ToolDefinition::new(
+            "capabilities",
+            "Discover supported inspection presets and limits",
+            json!({
+                "type": "object",
+                "properties": {
+                    "gating_mode": {"type": "string"}
+                }
             }),
         ),
     ]

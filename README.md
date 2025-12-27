@@ -256,6 +256,16 @@ The server exposes all tools through the MCP protocol. For debugging, you can:
 5. Add the corresponding `#[tool]` method to `RustMcpServer` in `src/server/handler.rs`
 6. Add analyzer client method to `src/analyzer/client.rs` if needed
 
+## Compiler Safety Limits and Errors
+
+To keep the server responsive and rust-analyzer interactions non-blocking, compilation helpers run with guardrails:
+
+- **30s timeout** for each `cargo rustc` invocation. Timeouts return a friendly MCP error explaining the limit and suggesting smaller targets or reduced output.
+- **1MB output limit** for combined compiler stdout/stderr, plus a **1MB per-artifact cap** when reading MIR/LLVM IR/assembly files. Oversize runs return an error that includes the observed size and the enforced limit.
+- Compiler work is isolated from the rust-analyzer LSP client, so long-running or failed compiler requests do not block navigation, diagnostics, or refactors.
+
+If you hit these limits, try narrowing the request to a specific target, symbol, or emission mode (e.g., a single function’s MIR) before retrying.
+
 ## Troubleshooting
 
 ### rust-analyzer Not Found
@@ -287,4 +297,3 @@ Or configure it in your MCP client configuration (see Configuration section abov
 2. Create a feature branch
 3. Implement your changes with tests
 4. Submit a pull request
-

@@ -17,7 +17,7 @@ use crate::analyzer::{
     symbol::{SymbolIdentity, SymbolKind, identity_from_definition},
 };
 use crate::compiler::{
-    CompilerRunner, RunRequest, RunResult,
+    CompilerRunner, RunRequest, RunResult, RunnerError,
     extract::{NormalizedSymbol, TargetedAssembly, extract_asm, extract_llvm_ir, extract_mir},
 };
 use crate::server::parameters::*;
@@ -984,10 +984,39 @@ impl RustMcpServer {
             additional_rustc_args: Vec::new(),
         };
 
-        let result = runner
-            .run(request)
-            .await
-            .map_err(|e| mcp_error(ErrorCode::INTERNAL_ERROR, format!("{e:#}"), None))?;
+        let result = runner.run(request).await.map_err(|e| {
+            if let Some(runner_error) = e.downcast_ref::<RunnerError>() {
+                match runner_error {
+                    RunnerError::Timeout(duration) => mcp_error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Compiler run timed out after {} seconds. Try narrowing the request or limiting emitted artifacts.",
+                            duration.as_secs()
+                        ),
+                        Some(json!({
+                            "timeout_seconds": duration.as_secs()
+                        })),
+                    ),
+                    RunnerError::OutputLimitExceeded { limit, observed } => mcp_error(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "Compiler output exceeded the safety limit ({} bytes > {} bytes). Try requesting a single target or reducing verbosity.",
+                            observed, limit
+                        ),
+                        Some(json!({
+                            "limit_bytes": limit,
+                            "observed_bytes": observed
+                        })),
+                    ),
+                }
+            } else {
+                mcp_error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("{e:#}"),
+                    None,
+                )
+            }
+        })?;
 
         if !result.status.success() {
             return Err(compiler_failure_error(&result));
@@ -999,6 +1028,29 @@ impl RustMcpServer {
 
 fn mcp_error(code: ErrorCode, message: impl Into<String>, data: Option<Value>) -> McpError {
     McpError::new(code, message.into(), data)
+}
+
+fn enforce_artifact_limit(path: &Path, size: usize) -> Result<(), McpError> {
+    const ARTIFACT_BYTE_LIMIT: usize = 1_000_000; // 1MB cap for compiler artifacts.
+
+    if size > ARTIFACT_BYTE_LIMIT {
+        return Err(mcp_error(
+            ErrorCode::INTERNAL_ERROR,
+            format!(
+                "Artifact {} exceeded the size limit ({} bytes > {} bytes). Request a smaller output (e.g., a single symbol or target).",
+                path.display(),
+                size,
+                ARTIFACT_BYTE_LIMIT
+            ),
+            Some(json!({
+                "artifact": path,
+                "limit_bytes": ARTIFACT_BYTE_LIMIT,
+                "observed_bytes": size
+            })),
+        ));
+    }
+
+    Ok(())
 }
 
 fn symbol_not_found_error(file_path: &str, line: u32, character: u32) -> McpError {
@@ -1060,6 +1112,8 @@ async fn read_artifacts(paths: &[PathBuf], extensions: &[&str]) -> Result<Vec<St
                 )
             })?;
 
+            enforce_artifact_limit(path, content.len())?;
+
             outputs.push(content);
         }
     }
@@ -1091,6 +1145,8 @@ async fn load_assembly_artifacts(
                 })),
             )
         })?;
+
+        enforce_artifact_limit(path, content.len())?;
 
         let target = infer_target_from_path(path)
             .or_else(|| target_hint.cloned())

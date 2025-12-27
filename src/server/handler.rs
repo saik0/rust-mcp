@@ -29,6 +29,11 @@ use crate::inspection::{
 use crate::server::parameters::*;
 use crate::tools::{execute_tool, get_tools};
 
+struct ResolvedDefinition {
+    symbol: Option<SymbolIdentity>,
+    text: String,
+}
+
 #[derive(Clone)]
 pub struct RustMcpServer {
     analyzer: Arc<Mutex<RustAnalyzerClient>>,
@@ -1020,92 +1025,115 @@ impl RustMcpServer {
         let workspace_guard = context.lock_workspace().await;
         provenance.workspace_locked = true;
 
-        let mut symbol = self
-            .resolve_normalized_symbol(file_path, line, character, symbol_name, target.clone())
-            .await?;
-
-        let run_result = self
-            .run_compiler(context, opt_level, target.clone(), view.emit, view.unpretty)
-            .await?;
-        provenance = provenance.with_command(run_result.command.join(" "));
-
         let mut diagnostics = Vec::new();
-        if !run_result.stderr.trim().is_empty() {
-            let (stderr, truncated_stderr, _) =
-                truncate_with_limits(&run_result.stderr, context.limits());
-            let prefix = if truncated_stderr {
-                "Compiler stderr (truncated):\n"
-            } else {
-                "Compiler stderr:\n"
-            };
-            diagnostics.push(format!("{prefix}{stderr}"));
-        }
+        let (output_text, symbol_name_out) = match view.name {
+            "def" => {
+                let resolved = self
+                    .resolve_definition(file_path, line, character, symbol_name)
+                    .await?;
 
-        let output_text = match view.name {
-            "mir" => {
-                let mir_outputs = vec![run_result.stdout.clone()];
-                extract_mir(&mir_outputs, &symbol).map_err(|e| {
-                    mcp_error(
-                        ErrorCode::RESOURCE_NOT_FOUND,
-                        format!("Unable to locate MIR for symbol: {e}"),
-                        None,
-                    )
-                })?
-            }
-            "llvm-ir" => {
-                let llvm_outputs =
-                    read_artifacts(&run_result.artifacts, &["ll"], context.limits()).await?;
-                if llvm_outputs.is_empty() {
-                    return Err(mcp_error(
-                        ErrorCode::INTERNAL_ERROR,
-                        "No LLVM IR artifacts were produced by the compiler",
-                        None,
-                    ));
-                }
-
-                extract_llvm_ir(&llvm_outputs, &symbol).map_err(|e| {
-                    mcp_error(
-                        ErrorCode::RESOURCE_NOT_FOUND,
-                        format!("Unable to locate LLVM IR for symbol: {e}"),
-                        None,
-                    )
-                })?
-            }
-            "asm" => {
-                let assemblies = load_assembly_artifacts(
-                    &run_result.artifacts,
-                    target.as_ref(),
-                    context.limits(),
+                (
+                    resolved.text,
+                    resolved.symbol.map(|sym| sym.item_name.clone()),
                 )
-                .await?;
-                if assemblies.is_empty() {
-                    return Err(mcp_error(
-                        ErrorCode::INTERNAL_ERROR,
-                        "No assembly artifacts were produced by the compiler",
-                        None,
-                    ));
-                }
-
-                let target_triple = target
-                    .clone()
-                    .or_else(|| assemblies.first().map(|asm| asm.target.clone()))
-                    .unwrap_or_else(|| "host".to_string());
-                symbol = symbol.with_target(target_triple.clone());
-
-                extract_asm(&assemblies, &symbol, &target_triple).map_err(|e| {
-                    mcp_error(
-                        ErrorCode::RESOURCE_NOT_FOUND,
-                        format!("Unable to locate assembly for symbol: {e}"),
-                        None,
-                    )
-                })?
             }
             _ => {
-                return Err(mcp_error(
-                    ErrorCode::INVALID_PARAMS,
-                    format!("Unsupported inspection view `{}`", view.name),
-                    None,
-                ));
+                let mut symbol = self
+                    .resolve_normalized_symbol(
+                        file_path,
+                        line,
+                        character,
+                        symbol_name,
+                        target.clone(),
+                    )
+                    .await?;
+
+                let run_result = self
+                    .run_compiler(context, opt_level, target.clone(), view.emit, view.unpretty)
+                    .await?;
+                provenance = provenance.with_command(run_result.command.join(" "));
+
+                if !run_result.stderr.trim().is_empty() {
+                    let (stderr, truncated_stderr, _) =
+                        truncate_with_limits(&run_result.stderr, context.limits());
+                    let prefix = if truncated_stderr {
+                        "Compiler stderr (truncated):\n"
+                    } else {
+                        "Compiler stderr:\n"
+                    };
+                    diagnostics.push(format!("{prefix}{stderr}"));
+                }
+
+                let output = match view.name {
+                    "mir" => {
+                        let mir_outputs = vec![run_result.stdout.clone()];
+                        extract_mir(&mir_outputs, &symbol).map_err(|e| {
+                            mcp_error(
+                                ErrorCode::RESOURCE_NOT_FOUND,
+                                format!("Unable to locate MIR for symbol: {e}"),
+                                None,
+                            )
+                        })?
+                    }
+                    "llvm-ir" => {
+                        let llvm_outputs =
+                            read_artifacts(&run_result.artifacts, &["ll"], context.limits())
+                                .await?;
+                        if llvm_outputs.is_empty() {
+                            return Err(mcp_error(
+                                ErrorCode::INTERNAL_ERROR,
+                                "No LLVM IR artifacts were produced by the compiler",
+                                None,
+                            ));
+                        }
+
+                        extract_llvm_ir(&llvm_outputs, &symbol).map_err(|e| {
+                            mcp_error(
+                                ErrorCode::RESOURCE_NOT_FOUND,
+                                format!("Unable to locate LLVM IR for symbol: {e}"),
+                                None,
+                            )
+                        })?
+                    }
+                    "asm" => {
+                        let assemblies = load_assembly_artifacts(
+                            &run_result.artifacts,
+                            target.as_ref(),
+                            context.limits(),
+                        )
+                        .await?;
+                        if assemblies.is_empty() {
+                            return Err(mcp_error(
+                                ErrorCode::INTERNAL_ERROR,
+                                "No assembly artifacts were produced by the compiler",
+                                None,
+                            ));
+                        }
+
+                        let target_triple = target
+                            .clone()
+                            .or_else(|| assemblies.first().map(|asm| asm.target.clone()))
+                            .unwrap_or_else(|| "host".to_string());
+                        symbol = symbol.with_target(target_triple.clone());
+
+                        extract_asm(&assemblies, &symbol, &target_triple).map_err(|e| {
+                            mcp_error(
+                                ErrorCode::RESOURCE_NOT_FOUND,
+                                format!("Unable to locate assembly for symbol: {e}"),
+                                None,
+                            )
+                        })?
+                    }
+                    _ => {
+                        return Err(mcp_error(
+                            ErrorCode::INVALID_PARAMS,
+                            format!("Unsupported inspection view `{}`", view.name),
+                            None,
+                        ));
+                    }
+                };
+
+                (output, Some(symbol.item_name.clone()))
             }
         };
 
@@ -1118,11 +1146,70 @@ impl RustMcpServer {
 
         Ok(InspectionResult {
             view: view.name.to_string(),
-            symbol: Some(symbol.item_name.clone()),
+            symbol: symbol_name_out,
             text,
             truncated,
             diagnostics,
             provenance: provenance.with_truncation(truncation),
+        })
+    }
+
+    async fn resolve_definition(
+        &self,
+        file_path: &str,
+        line: Option<u32>,
+        character: Option<u32>,
+        symbol_name: Option<String>,
+    ) -> Result<ResolvedDefinition, McpError> {
+        let (line, character) = match (line, character) {
+            (Some(line), Some(character)) => (line, character),
+            _ => {
+                return Err(mcp_error(
+                    ErrorCode::INVALID_PARAMS,
+                    "Both line and character are required to resolve a symbol",
+                    None,
+                ));
+            }
+        };
+
+        let mut analyzer = self.analyzer.lock().await;
+        let details = analyzer
+            .definition_details(file_path, line, character)
+            .await
+            .map_err(|e| {
+                mcp_error(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to resolve symbol: {e}"),
+                    None,
+                )
+            })?
+            .ok_or_else(|| symbol_not_found_error(file_path, line, character))?;
+
+        let mut identity = identity_from_definition(&details.location.uri, &details.symbol_path)
+            .ok_or_else(|| symbol_not_found_error(file_path, line, character))?;
+
+        if let Some(explicit) = symbol_name {
+            identity.item_name = explicit;
+        }
+
+        let symbol_path = details
+            .symbol_path
+            .iter()
+            .map(|segment| segment.name.clone())
+            .collect::<Vec<_>>()
+            .join("::");
+
+        let text = format!(
+            "Definition: {}:{}:{} ({})",
+            details.location.uri,
+            details.location.range.start.line + 1,
+            details.location.range.start.character + 1,
+            symbol_path
+        );
+
+        Ok(ResolvedDefinition {
+            symbol: Some(identity),
+            text,
         })
     }
 

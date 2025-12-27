@@ -5,9 +5,11 @@ use rmcp::{
     model::{ErrorData as McpError, *},
     tool, tool_handler, tool_router,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
 };
 use tokio::{fs, sync::Mutex};
@@ -20,6 +22,10 @@ use crate::compiler::{
     CompilerRunner, RunRequest, RunResult, RunnerError,
     extract::{NormalizedSymbol, TargetedAssembly, extract_asm, extract_llvm_ir, extract_mir},
 };
+use crate::inspection::{
+    GatingMode, InspectionCapabilities, InspectionContext, InspectionLimits, InspectionResult,
+    InspectionView, TruncationSummary, is_view_advertised, is_view_runnable, truncate_with_limits,
+};
 use crate::server::parameters::*;
 use crate::tools::{execute_tool, get_tools};
 
@@ -27,6 +33,7 @@ use crate::tools::{execute_tool, get_tools};
 pub struct RustMcpServer {
     analyzer: Arc<Mutex<RustAnalyzerClient>>,
     tool_router: ToolRouter<RustMcpServer>,
+    inspection: InspectionContext,
 }
 
 impl Default for RustMcpServer {
@@ -38,9 +45,11 @@ impl Default for RustMcpServer {
 #[tool_router]
 impl RustMcpServer {
     pub fn new() -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             analyzer: Arc::new(Mutex::new(RustAnalyzerClient::new())),
             tool_router: Self::tool_router(),
+            inspection: InspectionContext::new(workspace_root),
         }
     }
 
@@ -56,6 +65,84 @@ impl RustMcpServer {
     pub async fn call_tool(&mut self, name: &str, args: Value) -> Result<crate::tools::ToolResult> {
         let mut analyzer = self.analyzer.lock().await;
         execute_tool(name, args, &mut analyzer).await
+    }
+
+    #[tool(description = "Discover supported inspection presets and limits")]
+    async fn capabilities(
+        &self,
+        Parameters(CapabilitiesParams { gating_mode }): Parameters<CapabilitiesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let context = self.inspection_context(gating_mode.as_deref());
+
+        let views = InspectionView::curated()
+            .into_iter()
+            .filter(|view| {
+                is_view_advertised(view, context.toolchain_channel(), context.gating_mode())
+            })
+            .map(|view| view.name.to_string())
+            .collect::<Vec<_>>();
+
+        let mut diagnostics = Vec::new();
+        if matches!(context.gating_mode(), GatingMode::Lenient)
+            && !context.toolchain_channel().is_nightly_like()
+        {
+            diagnostics.extend(
+                InspectionView::curated()
+                    .into_iter()
+                    .filter(|view| view.requires_nightly)
+                    .map(|view| format!("View '{}' requires nightly", view.name)),
+            );
+        }
+
+        let capabilities = InspectionCapabilities {
+            toolchain_channel: context.toolchain_channel(),
+            gating_mode: context.gating_mode(),
+            views,
+            limits: context.limits().clone(),
+            diagnostics,
+            provenance: context.provenance(),
+        };
+
+        Ok(CallToolResult::success(vec![json_content(capabilities)?]))
+    }
+
+    #[tool(description = "Inspect compiler artifacts using curated presets")]
+    async fn inspect(
+        &self,
+        Parameters(InspectParams {
+            view,
+            file_path,
+            line,
+            character,
+            symbol_name,
+            opt_level,
+            target,
+            gating_mode,
+        }): Parameters<InspectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let context = self.inspection_context(gating_mode.as_deref());
+        let result = self
+            .perform_inspection(
+                &context,
+                &view,
+                &file_path,
+                Some(line),
+                Some(character),
+                symbol_name,
+                opt_level,
+                target,
+            )
+            .await?;
+
+        Ok(CallToolResult::success(vec![json_content(result)?]))
+    }
+
+    fn inspection_context(&self, gating_override: Option<&str>) -> InspectionContext {
+        let mut context = self.inspection.clone();
+        if let Some(mode) = gating_override.and_then(|value| GatingMode::from_str(value).ok()) {
+            context = context.with_gating_mode(mode);
+        }
+        context
     }
 
     #[tool(description = "Find the definition of a symbol at a given position")]
@@ -806,24 +893,21 @@ impl RustMcpServer {
             target,
         }): Parameters<InspectMirParams>,
     ) -> Result<CallToolResult, McpError> {
-        let symbol = self
-            .resolve_normalized_symbol(&file_path, line, character, symbol_name, target.clone())
-            .await?;
-
-        let run_result = self
-            .run_compiler(opt_level, target.clone(), None, Some("mir"))
-            .await?;
-
-        let mir_outputs = vec![run_result.stdout];
-        let mir = extract_mir(&mir_outputs, &symbol).map_err(|e| {
-            mcp_error(
-                ErrorCode::RESOURCE_NOT_FOUND,
-                format!("Unable to locate MIR for symbol: {e}"),
-                None,
+        let context = self.inspection_context(None);
+        let result = self
+            .perform_inspection(
+                &context,
+                "mir",
+                &file_path,
+                line,
+                character,
+                symbol_name,
+                opt_level,
+                target,
             )
-        })?;
+            .await?;
 
-        Ok(CallToolResult::success(vec![Content::text(mir)]))
+        Ok(CallToolResult::success(vec![json_content(result)?]))
     }
 
     #[tool(description = "Inspect LLVM IR for a symbol or position")]
@@ -838,32 +922,21 @@ impl RustMcpServer {
             target,
         }): Parameters<InspectLlvmIrParams>,
     ) -> Result<CallToolResult, McpError> {
-        let symbol = self
-            .resolve_normalized_symbol(&file_path, line, character, symbol_name, target.clone())
-            .await?;
-
-        let run_result = self
-            .run_compiler(opt_level, target.clone(), Some("llvm-ir"), None)
-            .await?;
-
-        let llvm_outputs = read_artifacts(&run_result.artifacts, &["ll"]).await?;
-        if llvm_outputs.is_empty() {
-            return Err(mcp_error(
-                ErrorCode::INTERNAL_ERROR,
-                "No LLVM IR artifacts were produced by the compiler",
-                None,
-            ));
-        }
-
-        let llvm_ir = extract_llvm_ir(&llvm_outputs, &symbol).map_err(|e| {
-            mcp_error(
-                ErrorCode::RESOURCE_NOT_FOUND,
-                format!("Unable to locate LLVM IR for symbol: {e}"),
-                None,
+        let context = self.inspection_context(None);
+        let result = self
+            .perform_inspection(
+                &context,
+                "llvm-ir",
+                &file_path,
+                line,
+                character,
+                symbol_name,
+                opt_level,
+                target,
             )
-        })?;
+            .await?;
 
-        Ok(CallToolResult::success(vec![Content::text(llvm_ir)]))
+        Ok(CallToolResult::success(vec![json_content(result)?]))
     }
 
     #[tool(description = "Inspect assembly for a symbol or position")]
@@ -878,38 +951,179 @@ impl RustMcpServer {
             target,
         }): Parameters<InspectAsmParams>,
     ) -> Result<CallToolResult, McpError> {
-        let mut symbol = self
-            .resolve_normalized_symbol(&file_path, line, character, symbol_name, target.clone())
+        let context = self.inspection_context(None);
+        let result = self
+            .perform_inspection(
+                &context,
+                "asm",
+                &file_path,
+                line,
+                character,
+                symbol_name,
+                opt_level,
+                target,
+            )
             .await?;
 
-        let run_result = self
-            .run_compiler(opt_level, target.clone(), Some("asm"), None)
-            .await?;
+        Ok(CallToolResult::success(vec![json_content(result)?]))
+    }
 
-        let assemblies = load_assembly_artifacts(&run_result.artifacts, target.as_ref()).await?;
-        if assemblies.is_empty() {
+    async fn perform_inspection(
+        &self,
+        context: &InspectionContext,
+        view_name: &str,
+        file_path: &str,
+        line: Option<u32>,
+        character: Option<u32>,
+        symbol_name: Option<String>,
+        opt_level: Option<String>,
+        target: Option<String>,
+    ) -> Result<InspectionResult, McpError> {
+        let Some(view) = InspectionView::find(view_name) else {
             return Err(mcp_error(
-                ErrorCode::INTERNAL_ERROR,
-                "No assembly artifacts were produced by the compiler",
+                ErrorCode::INVALID_PARAMS,
+                format!("Unknown inspection view `{view_name}`"),
+                None,
+            ));
+        };
+
+        if !is_view_advertised(&view, context.toolchain_channel(), context.gating_mode()) {
+            return Err(mcp_error(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "View `{}` is not available under {:?} gating for {:?}",
+                    view.name,
+                    context.gating_mode(),
+                    context.toolchain_channel()
+                ),
                 None,
             ));
         }
 
-        let target_triple = target
-            .clone()
-            .or_else(|| assemblies.first().map(|asm| asm.target.clone()))
-            .unwrap_or_else(|| "host".to_string());
-        symbol = symbol.with_target(target_triple.clone());
+        let mut provenance = context.provenance();
 
-        let asm = extract_asm(&assemblies, &symbol, &target_triple).map_err(|e| {
-            mcp_error(
-                ErrorCode::RESOURCE_NOT_FOUND,
-                format!("Unable to locate assembly for symbol: {e}"),
-                None,
-            )
-        })?;
+        if !is_view_runnable(&view, context.toolchain_channel()) {
+            return Ok(InspectionResult {
+                view: view.name.to_string(),
+                symbol: None,
+                text: String::new(),
+                truncated: false,
+                diagnostics: vec![format!(
+                    "View `{}` requires a nightly toolchain (detected {:?})",
+                    view.name,
+                    context.toolchain_channel()
+                )],
+                provenance,
+            });
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(asm)]))
+        let workspace_guard = context.lock_workspace().await;
+        provenance.workspace_locked = true;
+
+        let mut symbol = self
+            .resolve_normalized_symbol(file_path, line, character, symbol_name, target.clone())
+            .await?;
+
+        let run_result = self
+            .run_compiler(context, opt_level, target.clone(), view.emit, view.unpretty)
+            .await?;
+        provenance = provenance.with_command(run_result.command.join(" "));
+
+        let mut diagnostics = Vec::new();
+        if !run_result.stderr.trim().is_empty() {
+            let (stderr, truncated_stderr, _) =
+                truncate_with_limits(&run_result.stderr, context.limits());
+            let prefix = if truncated_stderr {
+                "Compiler stderr (truncated):\n"
+            } else {
+                "Compiler stderr:\n"
+            };
+            diagnostics.push(format!("{prefix}{stderr}"));
+        }
+
+        let output_text = match view.name {
+            "mir" => {
+                let mir_outputs = vec![run_result.stdout.clone()];
+                extract_mir(&mir_outputs, &symbol).map_err(|e| {
+                    mcp_error(
+                        ErrorCode::RESOURCE_NOT_FOUND,
+                        format!("Unable to locate MIR for symbol: {e}"),
+                        None,
+                    )
+                })?
+            }
+            "llvm-ir" => {
+                let llvm_outputs =
+                    read_artifacts(&run_result.artifacts, &["ll"], context.limits()).await?;
+                if llvm_outputs.is_empty() {
+                    return Err(mcp_error(
+                        ErrorCode::INTERNAL_ERROR,
+                        "No LLVM IR artifacts were produced by the compiler",
+                        None,
+                    ));
+                }
+
+                extract_llvm_ir(&llvm_outputs, &symbol).map_err(|e| {
+                    mcp_error(
+                        ErrorCode::RESOURCE_NOT_FOUND,
+                        format!("Unable to locate LLVM IR for symbol: {e}"),
+                        None,
+                    )
+                })?
+            }
+            "asm" => {
+                let assemblies = load_assembly_artifacts(
+                    &run_result.artifacts,
+                    target.as_ref(),
+                    context.limits(),
+                )
+                .await?;
+                if assemblies.is_empty() {
+                    return Err(mcp_error(
+                        ErrorCode::INTERNAL_ERROR,
+                        "No assembly artifacts were produced by the compiler",
+                        None,
+                    ));
+                }
+
+                let target_triple = target
+                    .clone()
+                    .or_else(|| assemblies.first().map(|asm| asm.target.clone()))
+                    .unwrap_or_else(|| "host".to_string());
+                symbol = symbol.with_target(target_triple.clone());
+
+                extract_asm(&assemblies, &symbol, &target_triple).map_err(|e| {
+                    mcp_error(
+                        ErrorCode::RESOURCE_NOT_FOUND,
+                        format!("Unable to locate assembly for symbol: {e}"),
+                        None,
+                    )
+                })?
+            }
+            _ => {
+                return Err(mcp_error(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("Unsupported inspection view `{}`", view.name),
+                    None,
+                ));
+            }
+        };
+
+        drop(workspace_guard);
+
+        let (text, truncated, truncation) = truncate_with_limits(&output_text, context.limits());
+        if let Some(summary) = &truncation {
+            diagnostics.push(truncation_note(summary));
+        }
+
+        Ok(InspectionResult {
+            view: view.name.to_string(),
+            symbol: Some(symbol.item_name.clone()),
+            text,
+            truncated,
+            diagnostics,
+            provenance: provenance.with_truncation(truncation),
+        })
     }
 
     async fn resolve_normalized_symbol(
@@ -968,12 +1182,13 @@ impl RustMcpServer {
 
     async fn run_compiler(
         &self,
+        context: &InspectionContext,
         opt_level: Option<String>,
         target: Option<String>,
         emit: Option<&str>,
         unpretty: Option<&str>,
     ) -> Result<RunResult, McpError> {
-        let runner = CompilerRunner::new();
+        let runner = CompilerRunner::with_target_dir(context.target_dir());
         let request = RunRequest {
             manifest_path: None,
             package: None,
@@ -982,9 +1197,10 @@ impl RustMcpServer {
             emit: emit.map(|emit| emit.to_string()),
             unpretty: unpretty.map(|unpretty| unpretty.to_string()),
             additional_rustc_args: Vec::new(),
+            env: context.env().clone(),
         };
 
-        let result = runner.run(request).await.map_err(|e| {
+        let result = runner.run(request, context.limits()).await.map_err(|e| {
             if let Some(runner_error) = e.downcast_ref::<RunnerError>() {
                 match runner_error {
                     RunnerError::Timeout(duration) => mcp_error(
@@ -995,17 +1211,6 @@ impl RustMcpServer {
                         ),
                         Some(json!({
                             "timeout_seconds": duration.as_secs()
-                        })),
-                    ),
-                    RunnerError::OutputLimitExceeded { limit, observed } => mcp_error(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!(
-                            "Compiler output exceeded the safety limit ({} bytes > {} bytes). Try requesting a single target or reducing verbosity.",
-                            observed, limit
-                        ),
-                        Some(json!({
-                            "limit_bytes": limit,
-                            "observed_bytes": observed
                         })),
                     ),
                 }
@@ -1026,25 +1231,44 @@ impl RustMcpServer {
     }
 }
 
+fn truncation_note(summary: &TruncationSummary) -> String {
+    format!(
+        "Output truncated to {} lines/{} bytes from {} lines/{} bytes",
+        summary.kept_lines, summary.kept_bytes, summary.original_lines, summary.original_bytes
+    )
+}
+
+fn json_content<T: Serialize>(value: T) -> Result<Content, McpError> {
+    Content::json(value).map_err(|e| {
+        mcp_error(
+            ErrorCode::INTERNAL_ERROR,
+            format!("Failed to serialize response: {e}"),
+            None,
+        )
+    })
+}
+
 fn mcp_error(code: ErrorCode, message: impl Into<String>, data: Option<Value>) -> McpError {
     McpError::new(code, message.into(), data)
 }
 
-fn enforce_artifact_limit(path: &Path, size: usize) -> Result<(), McpError> {
-    const ARTIFACT_BYTE_LIMIT: usize = 1_000_000; // 1MB cap for compiler artifacts.
-
-    if size > ARTIFACT_BYTE_LIMIT {
+fn enforce_artifact_limit(
+    path: &Path,
+    size: usize,
+    limits: &InspectionLimits,
+) -> Result<(), McpError> {
+    if size > limits.max_output_bytes {
         return Err(mcp_error(
             ErrorCode::INTERNAL_ERROR,
             format!(
                 "Artifact {} exceeded the size limit ({} bytes > {} bytes). Request a smaller output (e.g., a single symbol or target).",
                 path.display(),
                 size,
-                ARTIFACT_BYTE_LIMIT
+                limits.max_output_bytes
             ),
             Some(json!({
                 "artifact": path,
-                "limit_bytes": ARTIFACT_BYTE_LIMIT,
+                "limit_bytes": limits.max_output_bytes,
                 "observed_bytes": size
             })),
         ));
@@ -1085,12 +1309,17 @@ fn compiler_failure_error(result: &RunResult) -> McpError {
         Some(json!({
             "status": result.status.code(),
             "stdout": result.stdout,
-            "stderr": result.stderr
+            "stderr": result.stderr,
+            "command": result.command
         })),
     )
 }
 
-async fn read_artifacts(paths: &[PathBuf], extensions: &[&str]) -> Result<Vec<String>, McpError> {
+async fn read_artifacts(
+    paths: &[PathBuf],
+    extensions: &[&str],
+    limits: &InspectionLimits,
+) -> Result<Vec<String>, McpError> {
     let mut outputs = Vec::new();
 
     for path in paths {
@@ -1112,7 +1341,7 @@ async fn read_artifacts(paths: &[PathBuf], extensions: &[&str]) -> Result<Vec<St
                 )
             })?;
 
-            enforce_artifact_limit(path, content.len())?;
+            enforce_artifact_limit(path, content.len(), limits)?;
 
             outputs.push(content);
         }
@@ -1124,6 +1353,7 @@ async fn read_artifacts(paths: &[PathBuf], extensions: &[&str]) -> Result<Vec<St
 async fn load_assembly_artifacts(
     paths: &[PathBuf],
     target_hint: Option<&String>,
+    limits: &InspectionLimits,
 ) -> Result<Vec<TargetedAssembly>, McpError> {
     let mut assemblies = Vec::new();
 
@@ -1146,7 +1376,7 @@ async fn load_assembly_artifacts(
             )
         })?;
 
-        enforce_artifact_limit(path, content.len())?;
+        enforce_artifact_limit(path, content.len(), limits)?;
 
         let target = infer_target_from_path(path)
             .or_else(|| target_hint.cloned())
